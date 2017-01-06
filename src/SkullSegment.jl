@@ -1,5 +1,5 @@
 module SkullSegment
-using NIfTI
+using NIfTI, Compat
 include(joinpath(Pkg.dir("NIfTI"), "examples", "register.jl"))
 
 immutable XYZ
@@ -18,15 +18,16 @@ function process!(processed, to_process, v::XYZ)
     end
 end
 
-function floodfill(arr, seed::(Int, Int, Int), lb, ub)
+function floodfill(arr, seed::Tuple{Int, Int, Int}, lb, ub)
+    lb <= arr[seed[1], seed[2], seed[3]] <= ub || warn("seed voxel not in range")
     processed = zeros(Bool, size(arr))
     out = zeros(Bool, size(arr))
     to_process = [XYZ(seed[1], seed[2], seed[3])]
     processed[seed[1], seed[2], seed[3]] = 1
     while !isempty(to_process)
         cur = pop!(to_process)
-        out[cur] = true
         if lb <= arr[cur] <= ub
+            out[cur] = true
             cur.x > 1 && process!(processed, to_process, XYZ(cur.x-1, cur.y, cur.z))
             cur.x < size(arr, 1) && process!(processed, to_process, XYZ(cur.x+1, cur.y, cur.z))
             cur.y > 1 && process!(processed, to_process, XYZ(cur.x, cur.y-1, cur.z))
@@ -43,7 +44,7 @@ function addsuffix(path::String, suffix::String)
     dir = dirname(path)
     base = basename(path)
     dotindex = rsearch(base, '.')
-    joinpath(dir, base[1:dotindex-1]*suffix*base[dotindex:end])
+    joinpath(dir, base[1:dotindex-1]*"_"*suffix*base[dotindex:end])
 end
 
 # Average several anatomical volumes
@@ -62,6 +63,16 @@ function avg{T<:String}(paths::Vector{T}, out::String)
 	niwrite(out, NIVolume(ni.header, niraw))
 end
 
+function conform_header(origheader)
+    header = deepcopy(origheader)
+    header.pixdim = (header.pixdim[1], 1f0, 1f0, 1f0, header.pixdim[5:end]...)
+    header.xyzt_units = 0x02 # NIfTI_UNITS_MM
+    header.srow_x = map(x->x/origheader.pixdim[2], header.srow_x)
+    header.srow_y = map(x->x/origheader.pixdim[3], header.srow_y)
+    header.srow_z = map(x->x/origheader.pixdim[4], header.srow_z)
+    header
+end
+
 # Normalize T1 scan using N3
 function n3normalize(path::String)
     nu = addsuffix(path, "nu")
@@ -72,12 +83,8 @@ function n3normalize(path::String)
     # XXX This probably doesn't work if the slices aren't iso
     nutemp = tempname()*".nii"
     ni = niread(path, mmap=true)
-    origheader = deepcopy(ni.header)
-    ni.header.pixdim[2:4] = float32(1)
-    ni.header.xyzt_units = int8(2) # NIfTI_UNITS_MM
-    ni.header.srow_x /= origheader.pixdim[2]
-    ni.header.srow_y /= origheader.pixdim[3]
-    ni.header.srow_z /= origheader.pixdim[4]
+    origheader = ni.header
+    ni.header = conform_header(ni.header)
     niwrite(nutemp, ni)
 
     # Correct for inhomogeneity due to coils
@@ -86,6 +93,7 @@ function n3normalize(path::String)
     # by optimizing non-uniformity correction using N3. NeuroImage,
     # 48(1), 73–83. doi:10.1016/j.neuroimage.2009.06.039
     try
+        println(`mri_nu_correct.mni --i $nutemp --o $nu --proto-iters 1000 --distance 30`)
         run(`mri_nu_correct.mni --i $nutemp --o $nu --proto-iters 1000 --distance 30`)
     finally
         rm(nutemp)
@@ -97,11 +105,11 @@ function n3normalize(path::String)
     # Fix the dimensions
     for vol in (nu, wm110)
         ni = niread(vol, mmap=true)
-        ni.header.pixdim[2:4] = origheader.pixdim[2:4]
+        ni.header.pixdim = (ni.header.pixdim[1], origheader.pixdim[2:4]..., ni.header.pixdim[5:end]...)
         ni.header.xyzt_units = origheader.xyzt_units
-        ni.header.srow_x *= origheader.pixdim[2]
-        ni.header.srow_y *= origheader.pixdim[3]
-        ni.header.srow_z *= origheader.pixdim[4]
+        ni.header.srow_x = map(x->x*origheader.pixdim[2], ni.header.srow_x)
+        ni.header.srow_y = map(x->x*origheader.pixdim[3], ni.header.srow_y)
+        ni.header.srow_z = map(x->x*origheader.pixdim[4], ni.header.srow_z)
         f = open(vol, "r+")
         write(f, ni.header)
         close(f)
@@ -125,10 +133,92 @@ function extractbrain(path::String; threshold=0.4, flood=20)
         niwrite(masked, ni)
     end
 
-    maskvol = NIVolume(ni.header, uint8(ni.raw .!= 0))
-    maskvol = register(niread(path, mmap=true), maskvol)
+    # Register back to the original nu
+    maskvol = NIVolume(ni.header, 0xff*(ni.raw .!= 0))
+    nu = niread(addsuffix(path, "nu"), mmap=true)
+    maskvol = register(nu, maskvol)
     niwrite(mask, maskvol)
     mask
+end
+
+function postprocess_skull!(skull, nu, threshold)
+    # Clean up cases where we get too much skin
+    for k = 1:size(skull, 3), j = 1:size(skull, 2)
+        for i = 1:size(skull, 1)
+            if skull[i, j, k] != 0
+                for i2 = i:size(skull, 1)
+                    if nu[i2, j, k] >= threshold
+                        skull[i2, j, k] = 0
+                    else
+                        break
+                    end
+                end
+                break
+            end
+        end
+        for i = size(skull, 1):-1:1
+            if skull[i, j, k] != 0
+                for i2 = i:-1:1
+                    if nu[i2, j, k] >= threshold
+                        skull[i2, j, k] = 0
+                    else
+                        break
+                    end
+                end
+                break
+            end
+        end
+    end
+    skull
+end
+
+# Extract skull
+function extractskull(path::String; lower_threshold=0, upper_threshold=0, erode_threshold=90)
+    norm = addsuffix(path, "nu")
+    isfile(norm) || n3normalize(path)
+    mask = addsuffix(path, "mask")
+    isfile(mask) || extractbrain(path)
+
+    maskvol = niread(mask)
+    center = size(maskvol, 2) >> 1
+    slice = maskvol.raw[:, center, :]
+    proj = vec(sum(slice, 1))
+    bottom = findfirst(proj)-20
+    top = findlast(proj)+20
+    proj = vec(sum(slice, 3))
+    left = findfirst(proj)-30
+    right = findlast(proj)+30
+    slice = maskvol.raw[left+div(right-left+1, 2), :, bottom+div(top-bottom+1, 2)]
+    proj = vec(slice)
+    front = findfirst(proj)-30
+    back = findlast(proj)+50
+    center = div(back-front+1, 2)
+
+    vol = niread(norm)
+    volsubset = vol.raw[left:right, front:back, bottom:top]
+    fill!(vol.raw, 0)
+    vol.raw[left:right, front:back, bottom:top] = volsubset
+    cropped = addsuffix(path, "cropped")
+    # origheader = vol.header
+    # vol.header = conform_header(origheader)
+    niwrite(cropped, vol)
+
+    masksubset = maskvol.raw[left:right, front:back, bottom:top]
+    fill!(maskvol.raw, 0)
+    maskvol.raw[left:right, front:back, bottom:top] = masksubset
+    cropped_mask = addsuffix(path, "cropped_mask")
+    # maskvol.header = conform_header(maskvol.header)
+    niwrite(cropped_mask, maskvol)
+
+    skull = addsuffix(path, "skull")
+    run(`skullfinder -i $cropped -o $skull -m $cropped_mask -v 2 -l $lower_threshold -u $upper_threshold --scalplabel 0 --skulllabel 255 --spacelabel 255 --brainlabel 0`)
+
+    # skullfinder screws up the registration, so fix it
+    skullvol = niread(skull)
+    skullvol.header = vol.header
+    postprocess_skull!(skullvol.raw, vol.raw, erode_threshold)
+
+    niwrite(skull, skullvol)
 end
 
 # View brain
